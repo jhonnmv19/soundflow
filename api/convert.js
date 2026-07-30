@@ -2,11 +2,11 @@ import ytdl from '@distube/ytdl-core';
 
 export const config = {
   api: {
-    responseLimit: false, // Permite streams/buffers sin límite de peso
+    responseLimit: false,
   },
 };
 
-// 1. Cargar cookies de YouTube si están definidas
+// Cargar cookies de YouTube si existen en Vercel Env Vars
 let agent;
 if (process.env.YOUTUBE_COOKIES) {
   try {
@@ -18,7 +18,7 @@ if (process.env.YOUTUBE_COOKIES) {
 }
 
 export default async function handler(req, res) {
-  // Configurar cabeceras CORS
+  // Cabeceras CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -31,18 +31,17 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  const { url } = req.query;
+  const { url, quality = '192' } = req.query;
 
   if (!url) {
-    return res.status(400).json({ error: 'Proporciona una URL válida de YouTube.' });
+    return res.status(400).json({ error: 'Proporciona una URL válida.' });
   }
 
-  // --- INTENTO 1: YTDL-CORE CON COOKIES ---
+  // --- INTENTO 1: YTDL-CORE ---
   if (ytdl.validateURL(url)) {
     try {
       const info = await ytdl.getInfo(url, agent ? { agent } : {});
-
-      const rawTitle = info.videoDetails.title || 'Audio SoundFlow';
+      const rawTitle = info.videoDetails.title || 'SoundFlow Track';
       const rawArtist = info.videoDetails.author?.name || 'YouTube';
 
       const title = encodeURIComponent(rawTitle.replace(/[^\w\s-]/gi, ''));
@@ -55,106 +54,99 @@ export default async function handler(req, res) {
         filter: 'audioonly',
       });
 
-      if (format) {
-        res.setHeader('Content-Type', 'audio/mpeg');
-        res.setHeader('Content-Disposition', `attachment; filename="${title}.mp3"`);
-        res.setHeader('X-Audio-Title', title);
-        res.setHeader('X-Audio-Artist', artist);
-        res.setHeader('X-Audio-Duration', duration);
-        res.setHeader('X-Audio-Thumbnail', thumbnail);
+      if (format && format.url) {
+        // Redireccionar o streamear el audio de YouTube
+        const audioFetch = await fetch(format.url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+          }
+        });
 
-        if (format.contentLength) {
-          res.setHeader('Content-Length', format.contentLength);
+        if (audioFetch.ok) {
+          const arrayBuffer = await audioFetch.arrayBuffer();
+          const buffer = Buffer.from(arrayBuffer);
+
+          res.setHeader('Content-Type', 'audio/mpeg');
+          res.setHeader('Content-Disposition', `attachment; filename="${title}.mp3"`);
+          res.setHeader('X-Audio-Title', title);
+          res.setHeader('X-Audio-Artist', artist);
+          res.setHeader('X-Audio-Duration', duration);
+          res.setHeader('X-Audio-Thumbnail', thumbnail);
+          res.setHeader('Content-Length', buffer.length);
+
+          return res.status(200).send(buffer);
         }
-
-        const audioStream = ytdl.downloadFromInfo(info, {
-          format: format,
-          agent: agent,
-        });
-
-        audioStream.pipe(res);
-
-        audioStream.on('error', (err) => {
-          console.error('[YTDL Stream Error]:', err);
-        });
-
-        return; // Finaliza si YTDL funcionó correctamente
       }
     } catch (ytdlError) {
-      console.warn('[YTDL Falló - Usando Cobalt API optimizado]:', ytdlError.message);
+      console.warn('[YTDL Direct Falló - Probando API alternativa]:', ytdlError.message);
     }
   }
 
-  // --- INTENTO 2: COBALT API CON HEADERS DE NAVEGADOR Y RECUPERACIÓN DE FILENAME ---
-  try {
-    const cobaltResponse = await fetch('https://api.cobalt.tools/api/json', {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Origin': 'https://cobalt.tools',
-        'Referer': 'https://cobalt.tools/',
-      },
-      body: JSON.stringify({
-        url: url,
-        downloadMode: 'audio',
-        audioFormat: 'mp3',
-        audioBitrate: '128',
-      }),
-    });
+  // --- INTENTO 2: SERVICIO DE EXTRACCIÓN (INSTANCIAS COBALT / FALLBACK) ---
+  const cobaltInstances = [
+    'https://cobalt-api.kwiatek.xyz',
+    'https://api.cobalt.tools',
+    'https://cobalt-backend.jviguy.dev'
+  ];
 
-    if (!cobaltResponse.ok) {
-      const errText = await cobaltResponse.text();
-      throw new Error(`Error HTTP ${cobaltResponse.status}: ${errText}`);
+  for (const instance of cobaltInstances) {
+    try {
+      const response = await fetch(`${instance}/`, {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          url: url,
+          downloadMode: 'audio',
+          audioFormat: 'mp3',
+          audioBitrate: quality || '192'
+        })
+      });
+
+      // Si Cloudflare nos da 403, probamos la siguiente instancia
+      if (response.status === 403 || !response.ok) {
+        continue;
+      }
+
+      const data = await response.json();
+
+      if (data.status === 'error' || (!data.url && !data.picker)) {
+        continue;
+      }
+
+      const mediaUrl = data.url || (data.picker && data.picker[0]?.url);
+      if (!mediaUrl) continue;
+
+      // Descargamos el binario final
+      const audioRes = await fetch(mediaUrl);
+      if (!audioRes.ok) continue;
+
+      const arrayBuffer = await audioRes.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+
+      const rawFilename = data.filename || 'SoundFlow_Audio';
+      const cleanTitle = rawFilename.replace(/\.mp3$/i, '');
+      const safeTitle = encodeURIComponent(cleanTitle);
+
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp3"`);
+      res.setHeader('X-Audio-Title', safeTitle);
+      res.setHeader('X-Audio-Artist', encodeURIComponent('Audio Track'));
+      res.setHeader('X-Audio-Duration', '0');
+      res.setHeader('X-Audio-Thumbnail', '');
+      res.setHeader('Content-Length', buffer.length);
+
+      return res.status(200).send(buffer);
+
+    } catch (err) {
+      console.warn(`[Error intentando instancia ${instance}]:`, err.message);
     }
-
-    const cobaltData = await cobaltResponse.json();
-
-    if (cobaltData.status === 'error') {
-      throw new Error(cobaltData.text || 'Error en Cobalt API');
-    }
-
-    const mediaUrl = cobaltData.url || (cobaltData.picker && cobaltData.picker[0]?.url);
-
-    if (!mediaUrl) {
-      throw new Error('No se obtuvo un enlace de audio válido.');
-    }
-
-    // Descarga del binario emulando navegador
-    const audioFetch = await fetch(mediaUrl, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      },
-    });
-
-    if (!audioFetch.ok) {
-      throw new Error('No se pudo descargar el binario de audio desde la CDN.');
-    }
-
-    const arrayBuffer = await audioFetch.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    // Obtención del título real desde el nombre devuelto por Cobalt
-    const rawFilename = cobaltData.filename || 'SoundFlow_Track';
-    const cleanTitle = rawFilename.replace(/\.mp3$/i, '');
-    const safeTitle = encodeURIComponent(cleanTitle);
-
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp3"`);
-    res.setHeader('X-Audio-Title', safeTitle);
-    res.setHeader('X-Audio-Artist', encodeURIComponent('YouTube Track'));
-    res.setHeader('X-Audio-Duration', '0');
-    res.setHeader('X-Audio-Thumbnail', '');
-    res.setHeader('Content-Length', buffer.length);
-
-    return res.status(200).send(buffer);
-  } catch (error) {
-    console.error('[Convert API Error]:', error.message);
-    return res.status(500).json({
-      error: error.message || 'Error interno al procesar el audio.',
-    });
   }
+
+  // Si todas las opciones fallan
+  return res.status(500).json({
+    error: 'No se pudo procesar el enlace. YouTube / TikTok bloquearon la petición temporalmente.'
+  });
 }
