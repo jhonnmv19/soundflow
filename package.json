@@ -1,0 +1,9 @@
+{
+  "name": "soundflow-backend",
+  "version": "1.0.0",
+  "description": "SoundFlow API Converter",
+  "main": "api/convert.js",
+  "dependencies": {
+    "@distube/ytdl-core": "^4.15.8"
+  }
+}
