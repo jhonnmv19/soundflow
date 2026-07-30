@@ -5,13 +5,14 @@ export const config = {
 };
 
 /**
- * Limpia la URL de YouTube quitando parámetros de rastreo
+ * Limpia y normaliza enlaces de YouTube (remueve ?si=..., &feature=..., etc.)
  */
 function cleanYouTubeUrl(urlStr) {
   try {
     const parsed = new URL(urlStr);
     if (parsed.hostname.includes('youtu.be')) {
-      return `https://www.youtube.com/watch?v=${parsed.pathname.replace('/', '')}`;
+      const id = parsed.pathname.replace('/', '').split('?')[0];
+      return `https://www.youtube.com/watch?v=${id}`;
     }
     if (parsed.hostname.includes('youtube.com')) {
       const videoId = parsed.searchParams.get('v');
@@ -25,8 +26,26 @@ function cleanYouTubeUrl(urlStr) {
   }
 }
 
+/**
+ * Extrae el Video ID de una URL de YouTube
+ */
+function getYouTubeId(urlStr) {
+  try {
+    const parsed = new URL(urlStr);
+    if (parsed.hostname.includes('youtu.be')) {
+      return parsed.pathname.replace('/', '').split('?')[0];
+    }
+    if (parsed.hostname.includes('youtube.com')) {
+      return parsed.searchParams.get('v');
+    }
+  } catch (e) {
+    return null;
+  }
+  return null;
+}
+
 export default async function handler(req, res) {
-  // CORS Headers
+  // Configuración de cabeceras CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -42,8 +61,54 @@ export default async function handler(req, res) {
   }
 
   const sanitizedUrl = cleanYouTubeUrl(url);
+  const videoId = getYouTubeId(sanitizedUrl);
 
-  // 1. Probar con instancias públicas de Cobalt API (Modo Redirect/Stream Link)
+  // --- ESTRATEGIA 1: INVIDIOUS INSTANCES (Extracción directa de streams m4a/webm) ---
+  if (videoId) {
+    const invidiousInstances = [
+      'https://inv.riverside.rocks',
+      'https://invidious.nerdvpn.de',
+      'https://invidious.flokinet.to',
+      'https://invidious.drgns.space',
+      'https://vid.puffyan.us'
+    ];
+
+    for (const instance of invidiousInstances) {
+      try {
+        const invRes = await fetch(`${instance}/api/v1/videos/${videoId}`, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          }
+        });
+
+        if (!invRes.ok) continue;
+
+        const invData = await invRes.json();
+        const adaptiveFormats = invData.adaptiveFormats || [];
+
+        // Filtrar formatos exclusivamente de audio
+        const audioFormats = adaptiveFormats.filter(f => f.type && f.type.includes('audio'));
+
+        if (audioFormats.length > 0) {
+          // Ordenar por mejor bitrate/calidad
+          audioFormats.sort((a, b) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0));
+          const selectedAudio = audioFormats[0];
+
+          return res.status(200).json({
+            downloadUrl: selectedAudio.url,
+            title: invData.title || 'SoundFlow Track',
+            artist: invData.author || 'YouTube',
+            duration: invData.lengthSeconds || 0,
+            thumbnail: invData.videoThumbnails?.[0]?.url || ''
+          });
+        }
+      } catch (err) {
+        console.warn(`[Invidious ${instance} falló]:`, err.message);
+      }
+    }
+  }
+
+  // --- ESTRATEGIA 2: COBALT INSTANCES API V7 ---
   const cobaltInstances = [
     'https://api.cobalt.tools',
     'https://cobalt-api.kwiatek.xyz',
@@ -57,7 +122,7 @@ export default async function handler(req, res) {
         headers: {
           'Accept': 'application/json',
           'Content-Type': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         },
         body: JSON.stringify({
           url: sanitizedUrl,
@@ -86,32 +151,27 @@ export default async function handler(req, res) {
         thumbnail: ''
       });
     } catch (err) {
-      console.warn(`[Cobalt ${endpoint} error]:`, err.message);
+      console.warn(`[Cobalt ${endpoint} falló]:`, err.message);
     }
   }
 
-  // 2. Fallback con API Piped para enlaces de YouTube
-  try {
-    const parsedUrl = new URL(sanitizedUrl);
-    const videoId = parsedUrl.searchParams.get('v');
+  // --- ESTRATEGIA 3: PIPED API FALLBACK ---
+  if (videoId) {
+    const pipedInstances = [
+      'https://pipedapi.kavin.rocks',
+      'https://api.piped.private.coffee',
+      'https://pipedapi.mha.fi'
+    ];
 
-    if (videoId) {
-      const pipedInstances = [
-        'https://pipedapi.kavin.rocks',
-        'https://api.piped.private.coffee',
-        'https://pipedapi.mha.fi'
-      ];
+    for (const piped of pipedInstances) {
+      try {
+        const pipedRes = await fetch(`${piped}/streams/${videoId}`);
+        if (!pipedRes.ok) continue;
 
-      for (const piped of pipedInstances) {
-        try {
-          const pipedRes = await fetch(`${piped}/streams/${videoId}`);
-          if (!pipedRes.ok) continue;
+        const pipedData = await pipedRes.json();
+        const audioStreams = pipedData.audioStreams || [];
 
-          const pipedData = await pipedRes.json();
-          const audioStreams = pipedData.audioStreams || [];
-
-          if (audioStreams.length === 0) continue;
-
+        if (audioStreams.length > 0) {
           const bestAudio = audioStreams[0];
 
           return res.status(200).json({
@@ -121,16 +181,15 @@ export default async function handler(req, res) {
             duration: pipedData.duration || 0,
             thumbnail: pipedData.thumbnailUrl || ''
           });
-        } catch (e) {
-          console.warn(`[Piped ${piped} error]:`, e.message);
         }
+      } catch (e) {
+        console.warn(`[Piped ${piped} falló]:`, e.message);
       }
     }
-  } catch (err) {
-    console.warn('[Piped Error]:', err.message);
   }
 
+  // Si todas las instancias fallan
   return res.status(500).json({
-    error: 'No se pudo obtener el enlace de descarga. Intenta con otro video o verifica la URL.'
+    error: 'No se pudo procesar la descarga de este video. Los servidores de YouTube bloquearon la consulta. Intenta con otro video o enlace más tarde.'
   });
 }
