@@ -2,11 +2,11 @@ import ytdl from '@distube/ytdl-core';
 
 export const config = {
   api: {
-    responseLimit: false, // Desactiva el límite de payload en respuestas Vercel
+    responseLimit: false, // Permite streams/buffers sin límite de peso
   },
 };
 
-// 1. Cargar las cookies desde las variables de entorno de Vercel
+// 1. Cargar cookies de YouTube si están definidas
 let agent;
 if (process.env.YOUTUBE_COOKIES) {
   try {
@@ -33,72 +33,69 @@ export default async function handler(req, res) {
 
   const { url } = req.query;
 
-  if (!url || !ytdl.validateURL(url)) {
+  if (!url) {
     return res.status(400).json({ error: 'Proporciona una URL válida de YouTube.' });
   }
 
-  // --- INTENTO 1: YTDL-CORE CON AGENTE DE COOKIES ---
-  try {
-    const info = await ytdl.getInfo(url, agent ? { agent } : {});
+  // --- INTENTO 1: YTDL-CORE CON COOKIES ---
+  if (ytdl.validateURL(url)) {
+    try {
+      const info = await ytdl.getInfo(url, agent ? { agent } : {});
 
-    // Sanitizar títulos y metadatos para evitar caracteres no válidos en cabeceras HTTP
-    const rawTitle = info.videoDetails.title || 'Audio SoundFlow';
-    const rawArtist = info.videoDetails.author?.name || 'YouTube';
-    
-    const title = encodeURIComponent(rawTitle.replace(/[^\w\s-]/gi, ''));
-    const artist = encodeURIComponent(rawArtist.replace(/[^\w\s-]/gi, ''));
-    const duration = info.videoDetails.lengthSeconds || '0';
-    const thumbnail = encodeURIComponent(info.videoDetails.thumbnails?.[0]?.url || '');
+      const rawTitle = info.videoDetails.title || 'Audio SoundFlow';
+      const rawArtist = info.videoDetails.author?.name || 'YouTube';
 
-    const format = ytdl.chooseFormat(info.formats, {
-      quality: 'highestaudio',
-      filter: 'audioonly',
-    });
+      const title = encodeURIComponent(rawTitle.replace(/[^\w\s-]/gi, ''));
+      const artist = encodeURIComponent(rawArtist.replace(/[^\w\s-]/gi, ''));
+      const duration = info.videoDetails.lengthSeconds || '0';
+      const thumbnail = encodeURIComponent(info.videoDetails.thumbnails?.[0]?.url || '');
 
-    if (!format) {
-      throw new Error('No se encontró formato de audio válido en ytdl-core.');
-    }
+      const format = ytdl.chooseFormat(info.formats, {
+        quality: 'highestaudio',
+        filter: 'audioonly',
+      });
 
-    // Cabeceras HTTP para el cliente
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${title}.mp3"`);
-    res.setHeader('X-Audio-Title', title);
-    res.setHeader('X-Audio-Artist', artist);
-    res.setHeader('X-Audio-Duration', duration);
-    res.setHeader('X-Audio-Thumbnail', thumbnail);
+      if (format) {
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Content-Disposition', `attachment; filename="${title}.mp3"`);
+        res.setHeader('X-Audio-Title', title);
+        res.setHeader('X-Audio-Artist', artist);
+        res.setHeader('X-Audio-Duration', duration);
+        res.setHeader('X-Audio-Thumbnail', thumbnail);
 
-    if (format.contentLength) {
-      res.setHeader('Content-Length', format.contentLength);
-    }
+        if (format.contentLength) {
+          res.setHeader('Content-Length', format.contentLength);
+        }
 
-    // Streaming de audio directo
-    const audioStream = ytdl.downloadFromInfo(info, {
-      format: format,
-      agent: agent,
-    });
+        const audioStream = ytdl.downloadFromInfo(info, {
+          format: format,
+          agent: agent,
+        });
 
-    audioStream.pipe(res);
+        audioStream.pipe(res);
 
-    audioStream.on('error', (err) => {
-      console.error('[YTDL Stream Error]:', err);
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Error durante la transmisión del audio.' });
+        audioStream.on('error', (err) => {
+          console.error('[YTDL Stream Error]:', err);
+        });
+
+        return; // Finaliza si YTDL funcionó correctamente
       }
-    });
-
-    return; // Finaliza si YTDL tuvo éxito
-
-  } catch (ytdlError) {
-    console.warn('[YTDL Fallo - Intentando con Cobalt API]:', ytdlError.message);
+    } catch (ytdlError) {
+      console.warn('[YTDL Falló - Usando Cobalt API optimizado]:', ytdlError.message);
+    }
   }
 
-  // --- INTENTO 2: FALLBACK AUTOMÁTICO A COBALT API ---
+  // --- INTENTO 2: COBALT API CON HEADERS DE NAVEGADOR Y RECUPERACIÓN DE FILENAME ---
   try {
     const cobaltResponse = await fetch('https://api.cobalt.tools/api/json', {
       method: 'POST',
       headers: {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Origin': 'https://cobalt.tools',
+        'Referer': 'https://cobalt.tools/',
       },
       body: JSON.stringify({
         url: url,
@@ -108,36 +105,56 @@ export default async function handler(req, res) {
       }),
     });
 
+    if (!cobaltResponse.ok) {
+      const errText = await cobaltResponse.text();
+      throw new Error(`Error HTTP ${cobaltResponse.status}: ${errText}`);
+    }
+
     const cobaltData = await cobaltResponse.json();
 
     if (cobaltData.status === 'error') {
-      throw new Error(cobaltData.text || 'Error devuelto por Cobalt API.');
+      throw new Error(cobaltData.text || 'Error en Cobalt API');
     }
 
-    if (cobaltData.status === 'redirect' || cobaltData.status === 'stream') {
-      const audioBuffer = await fetch(cobaltData.url);
-      const arrayBuffer = await audioBuffer.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
+    const mediaUrl = cobaltData.url || (cobaltData.picker && cobaltData.picker[0]?.url);
 
-      const title = encodeURIComponent('Audio SoundFlow');
-      
-      res.setHeader('Content-Type', 'audio/mpeg');
-      res.setHeader('Content-Disposition', `attachment; filename="${title}.mp3"`);
-      res.setHeader('X-Audio-Title', title);
-      res.setHeader('X-Audio-Artist', encodeURIComponent('YouTube Track'));
-      res.setHeader('X-Audio-Duration', '180');
-      res.setHeader('X-Audio-Thumbnail', '');
-      res.setHeader('Content-Length', buffer.length);
-
-      return res.status(200).send(buffer);
+    if (!mediaUrl) {
+      throw new Error('No se obtuvo un enlace de audio válido.');
     }
 
-    throw new Error('Respuesta no válida del servidor de Cobalt.');
+    // Descarga del binario emulando navegador
+    const audioFetch = await fetch(mediaUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      },
+    });
 
-  } catch (cobaltError) {
-    console.error('[Cobalt API Error]:', cobaltError.message);
+    if (!audioFetch.ok) {
+      throw new Error('No se pudo descargar el binario de audio desde la CDN.');
+    }
+
+    const arrayBuffer = await audioFetch.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // Obtención del título real desde el nombre devuelto por Cobalt
+    const rawFilename = cobaltData.filename || 'SoundFlow_Track';
+    const cleanTitle = rawFilename.replace(/\.mp3$/i, '');
+    const safeTitle = encodeURIComponent(cleanTitle);
+
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp3"`);
+    res.setHeader('X-Audio-Title', safeTitle);
+    res.setHeader('X-Audio-Artist', encodeURIComponent('YouTube Track'));
+    res.setHeader('X-Audio-Duration', '0');
+    res.setHeader('X-Audio-Thumbnail', '');
+    res.setHeader('Content-Length', buffer.length);
+
+    return res.status(200).send(buffer);
+  } catch (error) {
+    console.error('[Convert API Error]:', error.message);
     return res.status(500).json({
-      error: 'No se pudo procesar el video con ninguna de las opciones disponibles.',
+      error: error.message || 'Error interno al procesar el audio.',
     });
   }
 }
