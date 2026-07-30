@@ -5,7 +5,7 @@ export const config = {
 };
 
 /**
- * Limpia la URL de YouTube quitando parámetros de rastreo (?si=..., &feature=..., etc.)
+ * Limpia la URL de YouTube quitando parámetros de rastreo
  */
 function cleanYouTubeUrl(urlStr) {
   try {
@@ -26,14 +26,10 @@ function cleanYouTubeUrl(urlStr) {
 }
 
 export default async function handler(req, res) {
-  // Configuración de cabeceras CORS
+  // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader(
-    'Access-Control-Expose-Headers',
-    'X-Audio-Title, X-Audio-Artist, X-Audio-Duration, X-Audio-Thumbnail, Content-Length, Content-Disposition'
-  );
 
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
@@ -47,14 +43,14 @@ export default async function handler(req, res) {
 
   const sanitizedUrl = cleanYouTubeUrl(url);
 
-  // --- ESTRATEGIA 1: COBALT API V7 ---
-  const cobaltEndpoints = [
+  // 1. Probar con instancias públicas de Cobalt API (Modo Redirect/Stream Link)
+  const cobaltInstances = [
     'https://api.cobalt.tools',
     'https://cobalt-api.kwiatek.xyz',
     'https://co.wuk.sh'
   ];
 
-  for (const endpoint of cobaltEndpoints) {
+  for (const endpoint of cobaltInstances) {
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
@@ -77,39 +73,24 @@ export default async function handler(req, res) {
 
       if (data.status === 'error' || (!data.url && !data.picker)) continue;
 
-      const mediaUrl = data.url || (data.picker && data.picker[0]?.url);
-      if (!mediaUrl) continue;
+      const streamUrl = data.url || (data.picker && data.picker[0]?.url);
+      if (!streamUrl) continue;
 
-      const audioFetch = await fetch(mediaUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
-        }
+      const title = data.filename ? data.filename.replace(/\.mp3$/i, '') : 'SoundFlow Audio';
+
+      return res.status(200).json({
+        downloadUrl: streamUrl,
+        title: title,
+        artist: 'YouTube Track',
+        duration: 0,
+        thumbnail: ''
       });
-
-      if (!audioFetch.ok) continue;
-
-      const arrayBuffer = await audioFetch.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-
-      const rawFilename = data.filename || 'SoundFlow_Track';
-      const cleanTitle = rawFilename.replace(/\.mp3$/i, '');
-      const safeTitle = encodeURIComponent(cleanTitle);
-
-      res.setHeader('Content-Type', 'audio/mpeg');
-      res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp3"`);
-      res.setHeader('X-Audio-Title', safeTitle);
-      res.setHeader('X-Audio-Artist', encodeURIComponent('Audio Track'));
-      res.setHeader('X-Audio-Duration', '0');
-      res.setHeader('X-Audio-Thumbnail', '');
-      res.setHeader('Content-Length', buffer.length);
-
-      return res.status(200).send(buffer);
     } catch (err) {
-      console.warn(`[Cobalt ${endpoint} falló]:`, err.message);
+      console.warn(`[Cobalt ${endpoint} error]:`, err.message);
     }
   }
 
-  // --- ESTRATEGIA 2: PIPED / INVIDIOUS API FALLBACK (Para enlaces de YouTube) ---
+  // 2. Fallback con API Piped para enlaces de YouTube
   try {
     const parsedUrl = new URL(sanitizedUrl);
     const videoId = parsedUrl.searchParams.get('v');
@@ -131,38 +112,25 @@ export default async function handler(req, res) {
 
           if (audioStreams.length === 0) continue;
 
-          // Seleccionar el stream de mejor calidad
           const bestAudio = audioStreams[0];
-          const audioStreamRes = await fetch(bestAudio.url);
 
-          if (!audioStreamRes.ok) continue;
-
-          const arrayBuffer = await audioStreamRes.arrayBuffer();
-          const buffer = Buffer.from(arrayBuffer);
-
-          const safeTitle = encodeURIComponent(pipedData.title || 'SoundFlow Track');
-          const safeArtist = encodeURIComponent(pipedData.uploader || 'YouTube');
-
-          res.setHeader('Content-Type', 'audio/mpeg');
-          res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp3"`);
-          res.setHeader('X-Audio-Title', safeTitle);
-          res.setHeader('X-Audio-Artist', safeArtist);
-          res.setHeader('X-Audio-Duration', pipedData.duration || '0');
-          res.setHeader('X-Audio-Thumbnail', encodeURIComponent(pipedData.thumbnailUrl || ''));
-          res.setHeader('Content-Length', buffer.length);
-
-          return res.status(200).send(buffer);
+          return res.status(200).json({
+            downloadUrl: bestAudio.url,
+            title: pipedData.title || 'SoundFlow Track',
+            artist: pipedData.uploader || 'YouTube',
+            duration: pipedData.duration || 0,
+            thumbnail: pipedData.thumbnailUrl || ''
+          });
         } catch (e) {
-          console.warn(`[Piped ${piped} falló]:`, e.message);
+          console.warn(`[Piped ${piped} error]:`, e.message);
         }
       }
     }
   } catch (err) {
-    console.warn('[Piped Fallback Error]:', err.message);
+    console.warn('[Piped Error]:', err.message);
   }
 
-  // Si todas las instancias fallan
   return res.status(500).json({
-    error: 'No se pudo obtener el audio. Intenta con otro enlace o más tarde.'
+    error: 'No se pudo obtener el enlace de descarga. Intenta con otro video o verifica la URL.'
   });
 }
